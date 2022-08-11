@@ -1,0 +1,298 @@
+diff --git a/.gitignore b/.gitignore
+index ec7f8bb..1d8eaa6 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -81,3 +81,19 @@ tests/rsacvt
+ tests/t-mpi-bit
+ tests/tsexp
+ tests/version
++doc/hmac256.1
++doc/yat2m
++doc/yat2m-stamp
++src/mpicalc
++tests/bench-slope
++tests/curves
++tests/dsa-rfc6979
++tests/hashtest
++tests/hashtest-256g
++tests/pkcs1v2
++tests/t-convert
++tests/t-ed25519
++tests/t-kdf
++tests/t-lock
++tests/t-mpi-point
++tests/mesh-victim
+\ No newline at end of file
+diff --git a/mpi/Makefile.am b/mpi/Makefile.am
+index c41b1ea..281696d 100644
+--- a/mpi/Makefile.am
++++ b/mpi/Makefile.am
+@@ -174,4 +174,16 @@ libmpi_la_SOURCES = longlong.h	   \
+ 	      mpih-div.c     \
+ 	      mpih-mul.c     \
+ 	      mpiutil.c      \
+-              ec.c ec-internal.h ec-ed25519.c
++              ec.c ec-internal.h ec-ed25519.c	\
++		  ../../../scutil/dont-mesh-around.h      \
++		  ../../../scutil/dont-mesh-around.c      \
++		  ../../../../util/util.h     	\
++		  ../../../../util/util.c		\
++		  ../../../../util/machine_const.h		\
++		  ../../../../util/pmon_utils.h			\
++		  ../../../../util/pmon_utils.c			\
++		  ../../../../util/skx_hash_utils.h	\
++		  ../../../../util/skx_hash_utils.c \
++		  ../../../../util/pfn_util.c \
++		  ../../../../util/pfn_util.h
++
+diff --git a/mpi/ec.c b/mpi/ec.c
+index 168076f..149f4b6 100644
+--- a/mpi/ec.c
++++ b/mpi/ec.c
+@@ -30,6 +30,7 @@
+ #include "ec-context.h"
+ #include "ec-internal.h"
+ 
++#include "../../../scutil/dont-mesh-around.h"       // dont-mesh-around
+ 
+ #define point_init(a)  _gcry_mpi_point_init ((a))
+ #define point_free(a)  _gcry_mpi_point_free_parts ((a))
+@@ -1117,7 +1118,10 @@ _gcry_mpi_ec_mul_point (mpi_point_t result,
+       mpi_set_ui (result->y, 1);
+       mpi_set_ui (result->z, 1);
+ 
+-      if (mpi_is_secure (scalar))
++      uint8_t attacking;  // dont-mesh-around
++      prepare_for_attack(&attacking); // dont-mesh-around
++
++      if (0 && mpi_is_secure (scalar))
+         {
+           /* If SCALAR is in secure memory we assume that it is the
+              secret key we use constant time operation.  */
+@@ -1137,11 +1141,23 @@ _gcry_mpi_ec_mul_point (mpi_point_t result,
+         {
+           for (j=nbits-1; j >= 0; j--)
+             {
++              check_attack_iteration(&attacking);  // dont-mesh-around
++              cryptoloop_check_a(&attacking);   // dont-mesh-around
++
+               _gcry_mpi_ec_dup_point (result, result, ctx);
+-              if (mpi_test_bit (scalar, j))
++
++              // cryptoloop_print_ground_truth_bit(mpi_test_bit (scalar, j));   // dont-mesh-around
++
++              if (mpi_test_bit (scalar, j)) {
++                cryptoloop_check_b(&attacking);   // dont-mesh-around
++
+                 _gcry_mpi_ec_add_points (result, result, point, ctx);
++              }
+             }
+         }
++
++      end_attack(&attacking); // dont-mesh-around
++
+       return;
+     }
+ 
+diff --git a/tests/Makefile.am b/tests/Makefile.am
+index 9645471..9f146c0 100644
+--- a/tests/Makefile.am
++++ b/tests/Makefile.am
+@@ -22,7 +22,7 @@ tests_bin = \
+         version mpitests tsexp t-convert \
+ 	t-mpi-bit t-mpi-point curves t-lock \
+ 	prime basic keygen pubkey hmac hashtest t-kdf keygrip \
+-	fips186-dsa aeswrap pkcs1v2 random dsa-rfc6979 t-ed25519
++	fips186-dsa aeswrap pkcs1v2 random dsa-rfc6979 t-ed25519 mesh-victim
+ 
+ tests_bin_last = benchmark bench-slope
+ 
+diff --git a/tests/mesh-victim.c b/tests/mesh-victim.c
+new file mode 100644
+index 0000000..92788bf
+--- /dev/null
++++ b/tests/mesh-victim.c
+@@ -0,0 +1,183 @@
++/*
++ * This is a simplified version of the pubkey.c unit test
++ * that we will use as the victim calling the functions
++ * of interest from the libgcrypt library.
++ *
++ * We run the victim from this test file because it's easier than writing a standalone C file.
++ * The test function called above performs one signature of some fixed hashed data, with a "random" key.
++ */
++
++#ifdef HAVE_CONFIG_H
++#include <config.h>
++#endif
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "../../../scutil/dont-mesh-around.h"
++
++#include "../src/gcrypt-int.h"
++
++#define my_isascii(c) (!((c) & 0x80))
++#define digitp(p)   (*(p) >= '0' && *(p) <= '9')
++#define hexdigitp(a) (digitp (a)                     \
++                      || (*(a) >= 'A' && *(a) <= 'F')  \
++                      || (*(a) >= 'a' && *(a) <= 'f'))
++#define xtoi_1(p)   (*(p) <= '9'? (*(p)- '0'): \
++                     *(p) <= 'F'? (*(p)-'A'+10):(*(p)-'a'+10))
++#define xtoi_2(p)   ((xtoi_1(p) * 16) + xtoi_1((p)+1))
++#define DIM(v)		     (sizeof(v)/sizeof((v)[0]))
++#define DIMof(type,member)   DIM(((type *)0)->member)
++
++static int verbose;
++static int error_count;
++
++static void
++die (const char *format, ...)
++{
++  va_list arg_ptr ;
++
++  va_start( arg_ptr, format ) ;
++  vfprintf (stderr, format, arg_ptr );
++  va_end(arg_ptr);
++  if (*format && format[strlen(format)-1] != '\n')
++    putc ('\n', stderr);
++  exit (1);
++}
++
++static void
++show_sexp (const char *prefix, gcry_sexp_t a)
++{
++  char *buf;
++  size_t size;
++
++  if (prefix)
++    fputs (prefix, stderr);
++  size = gcry_sexp_sprint (a, GCRYSEXP_FMT_ADVANCED, NULL, 0);
++  buf = gcry_xmalloc (size);
++
++  gcry_sexp_sprint (a, GCRYSEXP_FMT_ADVANCED, buf, size);
++  fprintf (stderr, "%.*s", (int)size, buf);
++  gcry_free (buf);
++}
++
++static void
++check_ed25519ecdsa_sample_key (void)
++{
++  static const char ecc_private_key_wo_q[] =
++    "(private-key\n"
++    " (ecc\n"
++    "  (curve \"Ed25519\")\n"
++    "  (d #B1D631B106D440C6BB97069918017C506C499BE097D546873E2B4A83F1CDB99F#)"
++    "))";
++  static const char hash_string[] =
++    "(data (flags rfc6979)\n"
++    " (hash sha256 #00112233445566778899AABBCCDDEEFF"
++    /* */          "000102030405060708090A0B0C0D0E0F#))";
++
++  gpg_error_t err;
++  gcry_sexp_t key, hash, sig;
++
++  /* Sign without a Q parameter.  */
++  if ((err = gcry_sexp_new (&hash, hash_string, 0, 1)))
++    die ("line %d: %s", __LINE__, gpg_strerror (err));
++
++  if ((err = gcry_sexp_new (&key, ecc_private_key_wo_q, 0, 1)))
++    die ("line %d: %s", __LINE__, gpg_strerror (err));
++
++  /*********************************************************/
++  // From here we basically provide an on-demand signing service
++  // to the monitor by repeating the gcry_pk_sign operation
++  int cha_id_to_cpu[26] = {0, 13, 7, -1, 
++                          1, 14, 8, 19, 2,
++                          15, 9, 20, 3,
++                          16, 10, 21, 4,
++                          17, 11, 22, 5, 18,
++                          12, 23, 6, -1};
++  int cpu = cha_id_to_cpu[0];
++  pin_cpu(cpu);
++
++  volatile struct sharestruct *mysharestruct = get_sharestruct();
++  mysharestruct->iteration_of_interest_running = 0;
++  mysharestruct->sign_requested = 0;
++  mysharestruct->use_randomized_key = 0;
++
++  fprintf(stderr, "\nGO\n");
++
++  while(1) {
++
++    // If a sign was requested
++    if (mysharestruct->sign_requested) {
++
++      if (mysharestruct->use_randomized_key == 1) {
++
++        mysharestruct->use_randomized_key = 0;
++
++        int sign_requested_tmp = mysharestruct->sign_requested;
++        mysharestruct->sign_requested = 0;
++
++        gcry_sexp_release (key);
++        mysharestruct->bit_of_the_iteration_of_interest = 0;
++
++        gcry_sexp_t key_spec, key_pair;
++        err = gcry_sexp_build (&key_spec, NULL,
++                                  "(genkey (ecdsa (curve \"Ed25519\")"
++                                  "(flags eddsa)))");
++        err = gcry_pk_genkey (&key_pair, key_spec);
++        gcry_sexp_release (key_spec);
++        key = gcry_sexp_find_token (key_pair, "private-key", 0);
++        gcry_sexp_release (key_pair);
++
++        if (! key)
++          die ("private part missing in key\n");
++
++        // Execute once to warm up cache
++        if ((err = gcry_pk_sign (&sig, hash, key)))
++          die ("gcry_pk_sign w/o Q failed: %s", gpg_strerror (err));
++
++        mysharestruct->sign_requested = sign_requested_tmp;
++      }
++
++      // Wait a moment for the attacker to get ready
++      wait_cycles(10000);
++
++      // Start vulnerable code
++      if ((err = gcry_pk_sign (&sig, hash, key)))
++        die ("gcry_pk_sign w/o Q failed: %s", gpg_strerror (err));
++    }
++  }
++
++  /*********************************************************/
++
++  gcry_sexp_release (sig);
++  gcry_sexp_release (key);
++  gcry_sexp_release (hash);
++}
++
++int
++main (int argc, char **argv)
++{
++  int debug = 0;
++
++  if (argc > 1 && !strcmp (argv[1], "--verbose"))
++    verbose = 1;
++  else if (argc > 1 && !strcmp (argv[1], "--debug"))
++    {
++      verbose = 2;
++      debug = 1;
++    }
++
++  gcry_control (GCRYCTL_DISABLE_SECMEM, 0);
++  if (!gcry_check_version (GCRYPT_VERSION))
++    die ("version mismatch\n");
++  gcry_control (GCRYCTL_INITIALIZATION_FINISHED, 0);
++  if (debug)
++    gcry_control (GCRYCTL_SET_DEBUG_FLAGS, 1u , 0);
++  /* No valuable keys are create, so we can speed up our RNG. */
++  gcry_control (GCRYCTL_ENABLE_QUICK_RANDOM, 0);
++
++  check_ed25519ecdsa_sample_key ();
++
++  return !!error_count;
++}

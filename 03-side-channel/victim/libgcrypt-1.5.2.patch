@@ -1,0 +1,389 @@
+diff --git a/.gitignore b/.gitignore
+index 1f3d13b..5bf1b68 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -86,3 +86,4 @@ tests/pkcs1v2
+ tests/t-kdf
+ /doc/gcrypt.info-1
+ /doc/gcrypt.info-2
++tests/mesh-victim
+\ No newline at end of file
+diff --git a/cipher/rsa.c b/cipher/rsa.c
+index ccc9f96..36a098d 100644
+--- a/cipher/rsa.c
++++ b/cipher/rsa.c
+@@ -914,6 +914,10 @@ static gcry_err_code_t
+ rsa_decrypt (int algo, gcry_mpi_t *result, gcry_mpi_t *data,
+              gcry_mpi_t *skey, int flags)
+ {
++  // dont-mesh-around: Disable blinding
++  // TODO: find the way to set this flag from the mesh-victim
++  flags = flags ^ PUBKEY_FLAG_NO_BLINDING;
++
+   RSA_secret_key sk;
+   gcry_mpi_t r = MPI_NULL;	/* Random number needed for blinding.  */
+   gcry_mpi_t ri = MPI_NULL;	/* Modular multiplicative inverse of
+diff --git a/mpi/Makefile.am b/mpi/Makefile.am
+index e900539..1dbd9a2 100644
+--- a/mpi/Makefile.am
++++ b/mpi/Makefile.am
+@@ -174,4 +174,18 @@ libmpi_la_SOURCES = longlong.h	   \
+ 	      mpih-div.c     \
+ 	      mpih-mul.c     \
+ 	      mpiutil.c      \
+-              ec.c
++              ec.c		 \
++		  ../../../scutil/dont-mesh-around.h      \
++		  ../../../scutil/dont-mesh-around.c      \
++		  ../../../../util/util.h     	\
++		  ../../../../util/util.c		\
++		  ../../../../util/machine_const.h		\
++		  ../../../../util/machine_const.c		\
++		  ../../../../util/pmon_utils.h			\
++		  ../../../../util/pmon_utils.c			\
++		  ../../../../util/skx_hash_utils.h	\
++		  ../../../../util/skx_hash_utils.c \
++		  ../../../../util/skx_hash_utils_addr_mapping.h \
++		  ../../../../util/pmon_reg_defs.h \
++		  ../../../../util/pfn_util.c \
++		  ../../../../util/pfn_util.h
+diff --git a/mpi/mpi-pow.c b/mpi/mpi-pow.c
+index 33bbebe..6221cb2 100644
+--- a/mpi/mpi-pow.c
++++ b/mpi/mpi-pow.c
+@@ -32,6 +32,7 @@
+ #include "mpi-internal.h"
+ #include "longlong.h"
+ 
++#include "../../../scutil/dont-mesh-around.h"       // dont-mesh-around
+ 
+ /****************
+  * RES = BASE ^ EXPO mod MOD
+@@ -183,9 +184,13 @@ gcry_mpi_powm (gcry_mpi_t res,
+     i = esize - 1;
+     e = ep[i];
+     count_leading_zeros (c, e);
++    // fprintf(stderr, "Lost %d bits\n", c);
+     e = (e << c) << 1;     /* Shift the expo bits to the left, lose msb.  */
+     c = BITS_PER_MPI_LIMB - 1 - c;
+ 
++    uint8_t attacking;  // dont-mesh-around
++    prepare_for_attack(&attacking); // dont-mesh-around
++
+     /* Main loop.
+ 
+        Make the result be pointed to alternately by XP and RP.  This
+@@ -198,6 +203,9 @@ gcry_mpi_powm (gcry_mpi_t res,
+       {
+         while (c)
+           {
++            check_attack_iteration(&attacking);  // dont-mesh-around
++            cryptoloop_check_a(&attacking);   // dont-mesh-around
++
+             mpi_ptr_t tp;
+             mpi_size_t xsize;
+ 
+@@ -230,8 +238,12 @@ gcry_mpi_powm (gcry_mpi_t res,
+             tp = rp; rp = xp; xp = tp;
+             rsize = xsize;
+ 
++            // cryptoloop_print_ground_truth_bit((mpi_limb_signed_t)e < 0);   // dont-mesh-around
++
+             if ( (mpi_limb_signed_t)e < 0 )
+               {
++                cryptoloop_check_b(&attacking);   // dont-mesh-around
++
+                 /*mpih_mul( xp, rp, rsize, bp, bsize );*/
+                 if( bsize < KARATSUBA_THRESHOLD )
+                   _gcry_mpih_mul ( xp, rp, rsize, bp, bsize );
+@@ -260,6 +272,8 @@ gcry_mpi_powm (gcry_mpi_t res,
+         c = BITS_PER_MPI_LIMB;
+       }
+ 
++	  end_attack(&attacking); // dont-mesh-around
++
+     /* We shifted MOD, the modulo reduction argument, left
+        MOD_SHIFT_CNT steps.  Adjust the result by reducing it with the
+        original MOD.
+diff --git a/tests/Makefile.am b/tests/Makefile.am
+index 689a3db..29c6a1b 100644
+--- a/tests/Makefile.am
++++ b/tests/Makefile.am
+@@ -20,7 +20,7 @@
+ 
+ TESTS = version t-mpi-bit prime register ac ac-schemes ac-data basic \
+         mpitests tsexp keygen pubkey hmac keygrip fips186-dsa aeswrap \
+-	curves t-kdf pkcs1v2
++	curves t-kdf pkcs1v2 mesh-victim
+ 
+ 
+ # random.c uses fork() thus a test for W32 does not make any sense.
+diff --git a/tests/mesh-victim.c b/tests/mesh-victim.c
+new file mode 100644
+index 0000000..8137e6f
+--- /dev/null
++++ b/tests/mesh-victim.c
+@@ -0,0 +1,263 @@
++/*
++ * This is a simplified version of the pubkey.c unit test
++ * that we will use as the victim calling the functions
++ * of interest from the libgcrypt library.
++ *
++ * We run the victim from this test file because it's easier than writing a standalone C file.
++ * The test function called above performs one signature of some fixed hashed data, with a "random" key.
++ */
++
++#ifdef HAVE_CONFIG_H
++#include <config.h>
++#endif
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "../../../scutil/dont-mesh-around.h"
++
++#include "../src/gcrypt.h"
++
++/* Sample RSA keys, taken from basic.c.  */
++
++static const char sample_private_key_1[] =
++"(private-key\n"
++" (openpgp-rsa\n"
++"  (n #00e0ce96f90b6c9e02f3922beada93fe50a875eac6bcc18bb9a9cf2e84965caa"
++      "2d1ff95a7f542465c6c0c19d276e4526ce048868a7a914fd343cc3a87dd74291"
++      "ffc565506d5bbb25cbac6a0e2dd1f8bcaab0d4a29c2f37c950f363484bf269f7"
++      "891440464baf79827e03a36e70b814938eebdc63e964247be75dc58b014b7ea251#)\n"
++"  (e #010001#)\n"
++"  (d #046129F2489D71579BE0A75FE029BD6CDB574EBF57EA8A5B0FDA942CAB943B11"
++      "7D7BB95E5D28875E0F9FC5FCC06A72F6D502464DABDED78EF6B716177B83D5BD"
++      "C543DC5D3FED932E59F5897E92E6F58A0F33424106A3B6FA2CBF877510E4AC21"
++      "C3EE47851E97D12996222AC3566D4CCB0B83D164074ABF7DE655FC2446DA1781#)\n"
++"  (p #00e861b700e17e8afe6837e7512e35b6ca11d0ae47d8b85161c67baf64377213"
++      "fe52d772f2035b3ca830af41d8a4120e1c1c70d12cc22f00d28d31dd48a8d424f1#)\n"
++"  (q #00f7a7ca5367c661f8e62df34f0d05c10c88e5492348dd7bddc942c9a8f369f9"
++      "35a07785d2db805215ed786e4285df1658eed3ce84f469b81b50d358407b4ad361#)\n"
++"  (u #304559a9ead56d2309d203811a641bb1a09626bc8eb36fffa23c968ec5bd891e"
++      "ebbafc73ae666e01ba7c8990bae06cc2bbe10b75e69fcacb353a6473079d8e9b#)\n"
++" )\n"
++")\n";
++
++/* The same key as above but without p, q and u to test the non CRT case. */
++static const char sample_private_key_1_1[] =
++"(private-key\n"
++" (openpgp-rsa\n"
++"  (n #00e0ce96f90b6c9e02f3922beada93fe50a875eac6bcc18bb9a9cf2e84965caa"
++      "2d1ff95a7f542465c6c0c19d276e4526ce048868a7a914fd343cc3a87dd74291"
++      "ffc565506d5bbb25cbac6a0e2dd1f8bcaab0d4a29c2f37c950f363484bf269f7"
++      "891440464baf79827e03a36e70b814938eebdc63e964247be75dc58b014b7ea251#)\n"
++"  (e #010001#)\n"
++"  (d #046129F2489D71579BE0A75FE029BD6CDB574EBF57EA8A5B0FDA942CAB943B11"
++      "7D7BB95E5D28875E0F9FC5FCC06A72F6D502464DABDED78EF6B716177B83D5BD"
++      "C543DC5D3FED932E59F5897E92E6F58A0F33424106A3B6FA2CBF877510E4AC21"
++      "C3EE47851E97D12996222AC3566D4CCB0B83D164074ABF7DE655FC2446DA1781#)\n"
++" )\n"
++")\n";
++
++/* The same key as above but just without q to test the non CRT case.  This
++   should fail. */
++static const char sample_private_key_1_2[] =
++"(private-key\n"
++" (openpgp-rsa\n"
++"  (n #00e0ce96f90b6c9e02f3922beada93fe50a875eac6bcc18bb9a9cf2e84965caa"
++      "2d1ff95a7f542465c6c0c19d276e4526ce048868a7a914fd343cc3a87dd74291"
++      "ffc565506d5bbb25cbac6a0e2dd1f8bcaab0d4a29c2f37c950f363484bf269f7"
++      "891440464baf79827e03a36e70b814938eebdc63e964247be75dc58b014b7ea251#)\n"
++"  (e #010001#)\n"
++"  (d #046129F2489D71579BE0A75FE029BD6CDB574EBF57EA8A5B0FDA942CAB943B11"
++      "7D7BB95E5D28875E0F9FC5FCC06A72F6D502464DABDED78EF6B716177B83D5BD"
++      "C543DC5D3FED932E59F5897E92E6F58A0F33424106A3B6FA2CBF877510E4AC21"
++      "C3EE47851E97D12996222AC3566D4CCB0B83D164074ABF7DE655FC2446DA1781#)\n"
++"  (p #00e861b700e17e8afe6837e7512e35b6ca11d0ae47d8b85161c67baf64377213"
++      "fe52d772f2035b3ca830af41d8a4120e1c1c70d12cc22f00d28d31dd48a8d424f1#)\n"
++"  (u #304559a9ead56d2309d203811a641bb1a09626bc8eb36fffa23c968ec5bd891e"
++      "ebbafc73ae666e01ba7c8990bae06cc2bbe10b75e69fcacb353a6473079d8e9b#)\n"
++" )\n"
++")\n";
++
++static const char sample_public_key_1[] =
++"(public-key\n"
++" (rsa\n"
++"  (n #00e0ce96f90b6c9e02f3922beada93fe50a875eac6bcc18bb9a9cf2e84965caa"
++      "2d1ff95a7f542465c6c0c19d276e4526ce048868a7a914fd343cc3a87dd74291"
++      "ffc565506d5bbb25cbac6a0e2dd1f8bcaab0d4a29c2f37c950f363484bf269f7"
++      "891440464baf79827e03a36e70b814938eebdc63e964247be75dc58b014b7ea251#)\n"
++"  (e #010001#)\n"
++" )\n"
++")\n";
++
++static void
++show_sexp (const char *prefix, gcry_sexp_t a)
++{
++  char *buf;
++  size_t size;
++
++  if (prefix)
++    fputs (prefix, stderr);
++  size = gcry_sexp_sprint (a, GCRYSEXP_FMT_ADVANCED, NULL, 0);
++  buf = gcry_xmalloc (size);
++
++  gcry_sexp_sprint (a, GCRYSEXP_FMT_ADVANCED, buf, size);
++  fprintf (stderr, "%.*s", (int)size, buf);
++  gcry_free (buf);
++}
++
++static void
++die (const char *format, ...)
++{
++  va_list arg_ptr ;
++
++  va_start( arg_ptr, format ) ;
++  vfprintf (stderr, format, arg_ptr );
++  va_end(arg_ptr);
++  exit (1);
++}
++
++static gcry_sexp_t
++get_key_wo_p_q_u (gcry_sexp_t a)
++{
++  char *buf;
++  size_t size;
++
++  size = gcry_sexp_sprint (a, GCRYSEXP_FMT_ADVANCED, NULL, 0);
++  buf = gcry_xmalloc (size);
++
++  gcry_sexp_sprint (a, GCRYSEXP_FMT_ADVANCED, buf, size);
++
++  char *p = strstr(buf, " (p ");
++  if (p != NULL) {
++    sprintf(p, ")\n)\n\0");
++  }
++
++  gcry_sexp_t skey;
++  gcry_sexp_sscan (&skey, NULL, buf, strlen (buf));
++
++  gcry_free (buf);
++  return skey;
++}
++
++static void
++check_run (void)
++{
++  gpg_error_t err;
++  gcry_sexp_t pkey, skey;
++  int rc;
++
++  rc = gcry_sexp_sscan (&pkey, NULL, sample_public_key_1, strlen (sample_public_key_1));
++  if (!rc)
++    rc = gcry_sexp_sscan (&skey, NULL, sample_private_key_1_1, strlen (sample_private_key_1_1));
++  if (rc)
++    die ("converting sample keys failed: %s\n", gcry_strerror (rc));
++
++  /* Check gcry_pk_testkey which requires all elements.  */
++  gcry_pk_testkey (skey);
++
++  /* Create plain text.  */
++  gcry_mpi_t x;
++  gcry_sexp_t plain;
++  unsigned int nbits_data = 800;
++  x = gcry_mpi_new (nbits_data);
++  gcry_mpi_randomize (x, nbits_data, GCRY_WEAK_RANDOM);
++  rc = gcry_sexp_build (&plain, NULL, "(data (flags raw no-blinding) (value %m))", x);
++  gcry_mpi_release (x);
++
++  gcry_sexp_t plain1, cipher, l;
++  gcry_mpi_t x0, x1;
++  int have_flags;
++
++  /* Extract data from plaintext.  */
++  l = gcry_sexp_find_token (plain, "value", 0);
++  x0 = gcry_sexp_nth_mpi (l, 1, GCRYMPI_FMT_USG);
++  gcry_sexp_release (l);
++
++  /* Encrypt data.  */
++  rc = gcry_pk_encrypt (&cipher, plain, pkey);
++  if (rc)
++    die ("encryption failed: %s\n", gcry_strerror (rc));
++
++  l = gcry_sexp_find_token (cipher, "flags", 0);
++  have_flags = !!l;
++  gcry_sexp_release (l);
++
++  /*********************************************************/
++  // From here we basically provide an on-demand decryption service
++  // to the monitor by repeating the gcry_pk_decrypt operation
++  int cha_id_to_cpu[26] = {0, 13, 7, -1, 
++                          1, 14, 8, 19, 2,
++                          15, 9, 20, 3,
++                          16, 10, 21, 4,
++                          17, 11, 22, 5, 18,
++                          12, 23, 6, -1};
++  int cpu = cha_id_to_cpu[0];
++  pin_cpu(cpu);
++
++  volatile struct sharestruct *mysharestruct = get_sharestruct();
++  mysharestruct->iteration_of_interest_running = 0;
++  mysharestruct->sign_requested = 0;
++  mysharestruct->use_randomized_key = 0;
++
++  fprintf(stderr, "\nGO\n");
++
++  gcry_sexp_t key_spec, key, sec_key, sig;
++  while(1) {
++
++    // If a sign was requested
++    if (mysharestruct->sign_requested) {
++
++      if (mysharestruct->use_randomized_key == 1) {
++
++        mysharestruct->use_randomized_key = 0;
++
++        int sign_requested_tmp = mysharestruct->sign_requested;
++        mysharestruct->sign_requested = 0;
++
++        gcry_sexp_release (skey);
++        mysharestruct->bit_of_the_iteration_of_interest = 0;
++
++        rc = gcry_sexp_new (&key_spec, "(genkey (rsa (nbits 4:1024)))", 0, 1);
++        if (rc)
++          die ("error creating S-expression: %s\n", gcry_strerror (rc));
++        rc = gcry_pk_genkey (&key, key_spec);
++        gcry_sexp_release (key_spec);
++        if (rc)
++          die ("error generating RSA key: %s\n", gcry_strerror (rc));
++        sec_key = gcry_sexp_find_token (key, "private-key", 0);
++        gcry_sexp_release (key);
++        skey = get_key_wo_p_q_u (sec_key);
++
++        // Execute once to bring into the cache
++        gcry_pk_decrypt (&plain1, cipher, skey);
++
++        mysharestruct->sign_requested = sign_requested_tmp;
++      }
++
++      // Wait a moment for the attacker to get ready
++      wait_cycles(10000);
++
++      // Start vulnerable RSA decryption code
++      gcry_pk_decrypt (&plain1, cipher, skey);
++    }
++  }
++
++  /*********************************************************/
++}
++
++int
++main (int argc, char **argv)
++{
++
++  gcry_control (GCRYCTL_DISABLE_SECMEM, 0);
++  if (!gcry_check_version (GCRYPT_VERSION))
++    die ("version mismatch\n");
++  gcry_control (GCRYCTL_INITIALIZATION_FINISHED, 0);
++  /* No valuable keys are create, so we can speed up our RNG. */
++  gcry_control (GCRYCTL_ENABLE_QUICK_RANDOM, 0);
++
++  check_run ();
++
++  return 0;
++}

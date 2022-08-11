@@ -1,0 +1,22 @@
+# Binary and object files
+bin
+obj
+out
+*.o
+
+# Python
+__pycache__
+venv
+*.pyc
+
+# Experiment outputs
+data
+models
+plot
+*.pdf
+*.out
+*.log
+
+# 03-side-channel libgcrypt repos
+03-side-channel/victim/libgcrypt-1.5.2
+03-side-channel/victim/libgcrypt-1.6.3
